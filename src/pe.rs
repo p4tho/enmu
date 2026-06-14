@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{ PathBuf };
 
+const FILE_HEADER_SIZE: usize = 20;
+const NT_HEADER_SIG_SIZE: usize = 4;
 const OPTIONAL_HDR32_MAGIC: [Byte; 2] = [0x01, 0x0b];
 
 type Byte = u8;
@@ -25,6 +27,7 @@ pub struct Editor {
     pub dos_header: DosHeader,
     pub file_header: FileHeader,
     pub optional_header: OptionalHeader,
+    pub section_table: SectionTable,
 }
 
 impl Editor {
@@ -50,15 +53,17 @@ impl Editor {
         }
 
         let dos_header = Self::parse_dos_header(&bytes);
-        let e_lfanew: u32 = from_bytes(dos_header.e_lfanew);
-        let file_header = Self::parse_file_header(&bytes, e_lfanew as usize);
-        let optional_header = Self::parse_optional_header(&bytes, e_lfanew as usize);
+        let e_lfanew = from_bytes::<u32>(dos_header.e_lfanew) as usize;
+        let file_header = Self::parse_file_header(&bytes, e_lfanew);
+        let optional_header = Self::parse_optional_header(&bytes, e_lfanew);
+        let section_table = Self::parse_section_table(&bytes, &file_header, e_lfanew);
         
         Ok(Self {
             bytes,
             dos_header,
             file_header,
             optional_header,
+            section_table,
         })
     }
 
@@ -239,6 +244,48 @@ impl Editor {
             data_directories,
         }
     }
+
+    /// Use FileHeader to tell how many sections there are, and iterate that number of times.
+    /// Each iteration extracts 40 bytes of data to create a SectionTableEntry.
+    fn parse_section_table(buf: &[Byte], file_header: &FileHeader, e_lfanew: usize) -> SectionTable {
+        let mut table: SectionTable = SectionTable::new();
+        let mut pos: usize = 0;
+        let total_offset = e_lfanew as usize 
+            + NT_HEADER_SIG_SIZE 
+            + FILE_HEADER_SIZE 
+            + from_bytes::<u16>(file_header.size_of_optional_header) as usize;
+        let section_table_buf: &[u8] = &buf[total_offset..];
+    
+        for _ in 0..from_bytes::<u16>(file_header.number_of_sections) {
+            let name = read_n_bytes_le::<8>(&section_table_buf, &mut pos);
+            let virtual_size = read_n_bytes_le::<4>(&section_table_buf, &mut pos);
+            let virtual_addr = read_n_bytes_le::<4>(&section_table_buf, &mut pos);
+            let size_of_raw_data = read_n_bytes_le::<4>(&section_table_buf, &mut pos);
+            let pointer_to_raw_data = read_n_bytes_le::<4>(&section_table_buf, &mut pos);
+            let pointer_to_relocations = read_n_bytes_le::<4>(&section_table_buf, &mut pos);
+            let pointer_to_line_nums = read_n_bytes_le::<4>(&section_table_buf, &mut pos);
+            let number_of_relocations = read_n_bytes_le::<2>(&section_table_buf, &mut pos);
+            let number_of_line_nums = read_n_bytes_le::<2>(&section_table_buf, &mut pos);
+            let characteristics = read_n_bytes_le::<4>(&section_table_buf, &mut pos);
+            
+            let entry = SectionTableEntry {
+                name,
+                virtual_size,
+                virtual_addr,
+                size_of_raw_data,
+                pointer_to_raw_data,
+                pointer_to_relocations,
+                pointer_to_line_nums,
+                number_of_relocations,
+                number_of_line_nums,
+                characteristics,
+            };
+    
+            table.push(entry);
+        }
+        
+        table
+    }
 }
 
 /// 64-byte structure on all target architectures
@@ -321,6 +368,32 @@ pub struct OptionalHeader {
 pub struct ImageDataDirectory {
     address: [Byte; 4],
     size: [Byte; 4],
+}
+
+pub type SectionTable = Vec<SectionTableEntry>;
+
+#[derive(Debug, PartialEq)]
+pub struct SectionTableEntry {
+    name: [Byte; 8],
+    virtual_size: [Byte; 4],
+    virtual_addr: [Byte; 4],
+    size_of_raw_data: [Byte; 4],
+    pointer_to_raw_data: [Byte; 4],
+    pointer_to_relocations: [Byte; 4],
+    pointer_to_line_nums: [Byte; 4],
+    number_of_relocations: [Byte; 2],
+    number_of_line_nums: [Byte; 2],
+    characteristics: [Byte; 4],
+}
+
+pub fn get_section_bytes<'a>(
+    buf: &'a [u8],
+    section: &SectionTableEntry,
+) -> &'a [u8] {
+    let start = from_bytes::<u32>(section.pointer_to_raw_data) as usize;
+    let end = start + from_bytes::<u32>(section.size_of_raw_data) as usize;
+
+    &buf[start..end]
 }
 
 fn read_n_bytes_le<const N: usize>(buf: &[u8], pos: &mut usize) -> [Byte; N] {
@@ -529,8 +602,8 @@ mod test {
         let path_buf = PathBuf::from("tests/binaries/hello_gui_32.exe");
         let editor = Editor::new(&path_buf).unwrap();
         let dos_header = Editor::parse_dos_header(&editor.bytes);
-        let e_lfanew: u32 = from_bytes(dos_header.e_lfanew);
-        let file_header = Editor::parse_file_header(&editor.bytes, e_lfanew as usize);
+        let e_lfanew = from_bytes::<u32>(dos_header.e_lfanew) as usize;
+        let file_header = Editor::parse_file_header(&editor.bytes, e_lfanew);
         let expected_file_header = FileHeader {
             machine: to_bytes(0x14c as u16),
             number_of_sections: to_bytes(0x4 as u16),
@@ -549,8 +622,8 @@ mod test {
         let path_buf = PathBuf::from("tests/binaries/hello_gui_64.exe");
         let editor = Editor::new(&path_buf).unwrap();
         let dos_header = Editor::parse_dos_header(&editor.bytes);
-        let e_lfanew: u32 = from_bytes(dos_header.e_lfanew);
-        let file_header = Editor::parse_file_header(&editor.bytes, e_lfanew as usize);
+        let e_lfanew = from_bytes::<u32>(dos_header.e_lfanew) as usize;
+        let file_header = Editor::parse_file_header(&editor.bytes, e_lfanew);
         let expected_file_header = FileHeader {
             machine: to_bytes(0x8664 as u16),
             number_of_sections: to_bytes(0x5 as u16),
@@ -569,8 +642,8 @@ mod test {
         let path_buf = PathBuf::from("tests/binaries/hello_gui_32.exe");
         let editor = Editor::new(&path_buf).unwrap();
         let dos_header = Editor::parse_dos_header(&editor.bytes);
-        let e_lfanew: u32 = from_bytes(dos_header.e_lfanew);
-        let optional_header = Editor::parse_optional_header(&editor.bytes, e_lfanew as usize);
+        let e_lfanew = from_bytes::<u32>(dos_header.e_lfanew) as usize;
+        let optional_header = Editor::parse_optional_header(&editor.bytes, e_lfanew);
         let expected_optional_header = OptionalHeader {
             magic: to_bytes(0x10b as u16),
             major_linker_ver: to_bytes(0xe as u8),
@@ -680,8 +753,8 @@ mod test {
         let path_buf = PathBuf::from("tests/binaries/hello_gui_64.exe");
         let editor = Editor::new(&path_buf).unwrap();
         let dos_header = Editor::parse_dos_header(&editor.bytes);
-        let e_lfanew: u32 = from_bytes(dos_header.e_lfanew);
-        let optional_header = Editor::parse_optional_header(&editor.bytes, e_lfanew as usize);
+        let e_lfanew = from_bytes::<u32>(dos_header.e_lfanew) as usize;
+        let optional_header = Editor::parse_optional_header(&editor.bytes, e_lfanew);
         let expected_optional_header = OptionalHeader {
             magic: to_bytes(0x20b as u16),
             major_linker_ver: to_bytes(0xe as u8),
@@ -784,5 +857,143 @@ mod test {
 
 
         assert_eq!(optional_header, expected_optional_header);
+    }
+
+    #[test]
+    fn correct_section_table_32() {
+        let path_buf = PathBuf::from("tests/binaries/hello_gui_32.exe");
+        let editor = Editor::new(&path_buf).unwrap();
+        let dos_header = Editor::parse_dos_header(&editor.bytes);
+        let e_lfanew = from_bytes::<u32>(dos_header.e_lfanew) as usize;
+        let file_header = Editor::parse_file_header(&editor.bytes, e_lfanew);
+        
+        let section_table = Editor::parse_section_table(&editor.bytes, &file_header, e_lfanew as usize);
+        let expected_section_table: SectionTable = vec![
+            SectionTableEntry {
+                name: to_bytes(0x747865742e as u64),
+                virtual_size: to_bytes(0x1357c as u32),
+                virtual_addr: to_bytes(0x1000 as u32),
+                size_of_raw_data: to_bytes(0x13600 as u32),
+                pointer_to_raw_data: to_bytes(0x400 as u32),
+                pointer_to_relocations: to_bytes(0x0 as u32),
+                pointer_to_line_nums: to_bytes(0x0 as u32),
+                number_of_relocations: to_bytes(0x0 as u16),
+                number_of_line_nums: to_bytes(0x0 as u16),
+                characteristics: to_bytes(0x60000020 as u32),
+            },
+            SectionTableEntry {
+                name: to_bytes(0x61746164722e as u64),
+                virtual_size: to_bytes(0x4ba2 as u32),
+                virtual_addr: to_bytes(0x15000 as u32),
+                size_of_raw_data: to_bytes(0x4c00 as u32),
+                pointer_to_raw_data: to_bytes(0x13a00 as u32),
+                pointer_to_relocations: to_bytes(0x0 as u32),
+                pointer_to_line_nums: to_bytes(0x0 as u32),
+                number_of_relocations: to_bytes(0x0 as u16),
+                number_of_line_nums: to_bytes(0x0 as u16),
+                characteristics: to_bytes(0x40000040 as u32),
+            },
+            SectionTableEntry {
+                name: to_bytes(0x617461642e as u64),
+                virtual_size: to_bytes(0x524 as u32),
+                virtual_addr: to_bytes(0x1a000 as u32),
+                size_of_raw_data: to_bytes(0x200 as u32),
+                pointer_to_raw_data: to_bytes(0x18600 as u32),
+                pointer_to_relocations: to_bytes(0x0 as u32),
+                pointer_to_line_nums: to_bytes(0x0 as u32),
+                number_of_relocations: to_bytes(0x0 as u16),
+                number_of_line_nums: to_bytes(0x0 as u16),
+                characteristics: to_bytes(0xC0000040 as u32),
+            },
+            SectionTableEntry {
+                name: to_bytes(0x636f6c65722e as u64),
+                virtual_size: to_bytes(0xda0 as u32),
+                virtual_addr: to_bytes(0x1b000 as u32),
+                size_of_raw_data: to_bytes(0xe00 as u32),
+                pointer_to_raw_data: to_bytes(0x18800 as u32),
+                pointer_to_relocations: to_bytes(0x0 as u32),
+                pointer_to_line_nums: to_bytes(0x0 as u32),
+                number_of_relocations: to_bytes(0x0 as u16),
+                number_of_line_nums: to_bytes(0x0 as u16),
+                characteristics: to_bytes(0x42000040 as u32),
+            },
+        ];
+
+        assert_eq!(section_table, expected_section_table);
+    }
+
+    #[test]
+    fn correct_section_table_64() {
+        let path_buf = PathBuf::from("tests/binaries/hello_gui_64.exe");
+        let editor = Editor::new(&path_buf).unwrap();
+        let dos_header = Editor::parse_dos_header(&editor.bytes);
+        let e_lfanew = from_bytes::<u32>(dos_header.e_lfanew) as usize;
+        let file_header = Editor::parse_file_header(&editor.bytes, e_lfanew);
+        
+        let section_table = Editor::parse_section_table(&editor.bytes, &file_header, e_lfanew as usize);
+        let expected_section_table: SectionTable = vec![
+            SectionTableEntry {
+                name: to_bytes(0x747865742e as u64),
+                virtual_size: to_bytes(0x142be as u32),
+                virtual_addr: to_bytes(0x1000 as u32),
+                size_of_raw_data: to_bytes(0x14400 as u32),
+                pointer_to_raw_data: to_bytes(0x400 as u32),
+                pointer_to_relocations: to_bytes(0x0 as u32),
+                pointer_to_line_nums: to_bytes(0x0 as u32),
+                number_of_relocations: to_bytes(0x0 as u16),
+                number_of_line_nums: to_bytes(0x0 as u16),
+                characteristics: to_bytes(0x60000020 as u32),
+            },
+            SectionTableEntry {
+                name: to_bytes(0x61746164722e as u64),
+                virtual_size: to_bytes(0x6b36 as u32),
+                virtual_addr: to_bytes(0x16000 as u32),
+                size_of_raw_data: to_bytes(0x6c00 as u32),
+                pointer_to_raw_data: to_bytes(0x14800 as u32),
+                pointer_to_relocations: to_bytes(0x0 as u32),
+                pointer_to_line_nums: to_bytes(0x0 as u32),
+                number_of_relocations: to_bytes(0x0 as u16),
+                number_of_line_nums: to_bytes(0x0 as u16),
+                characteristics: to_bytes(0x40000040 as u32),
+            },
+            SectionTableEntry {
+                name: to_bytes(0x617461642e as u64),
+                virtual_size: to_bytes(0x2d0 as u32),
+                virtual_addr: to_bytes(0x1d000 as u32),
+                size_of_raw_data: to_bytes(0x200 as u32),
+                pointer_to_raw_data: to_bytes(0x1b400 as u32),
+                pointer_to_relocations: to_bytes(0x0 as u32),
+                pointer_to_line_nums: to_bytes(0x0 as u32),
+                number_of_relocations: to_bytes(0x0 as u16),
+                number_of_line_nums: to_bytes(0x0 as u16),
+                characteristics: to_bytes(0xC0000040 as u32),
+            },
+            SectionTableEntry {
+                name: to_bytes(0x61746164702e as u64),
+                virtual_size: to_bytes(0xdd4 as u32),
+                virtual_addr: to_bytes(0x1e000 as u32),
+                size_of_raw_data: to_bytes(0xe00 as u32),
+                pointer_to_raw_data: to_bytes(0x1b600 as u32),
+                pointer_to_relocations: to_bytes(0x0 as u32),
+                pointer_to_line_nums: to_bytes(0x0 as u32),
+                number_of_relocations: to_bytes(0x0 as u16),
+                number_of_line_nums: to_bytes(0x0 as u16),
+                characteristics: to_bytes(0x40000040 as u32),
+            },
+            SectionTableEntry {
+                name: to_bytes(0x636f6c65722e as u64),
+                virtual_size: to_bytes(0x204 as u32),
+                virtual_addr: to_bytes(0x1f000 as u32),
+                size_of_raw_data: to_bytes(0x400 as u32),
+                pointer_to_raw_data: to_bytes(0x1c400 as u32),
+                pointer_to_relocations: to_bytes(0x0 as u32),
+                pointer_to_line_nums: to_bytes(0x0 as u32),
+                number_of_relocations: to_bytes(0x0 as u16),
+                number_of_line_nums: to_bytes(0x0 as u16),
+                characteristics: to_bytes(0x42000040 as u32),
+            },
+        ];
+
+        assert_eq!(section_table, expected_section_table);
     }
 }
