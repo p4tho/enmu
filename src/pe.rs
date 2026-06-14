@@ -1,7 +1,15 @@
 use std::fs;
 use std::path::{ PathBuf };
 
+const OPTIONAL_HDR32_MAGIC: [Byte; 2] = [0x01, 0x0b];
+
 type Byte = u8;
+
+#[derive(Debug, PartialEq)]
+enum DifArch {
+    B32([Byte; 4]),
+    B64([Byte; 8]),
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum EditorError {
@@ -16,6 +24,7 @@ pub struct Editor {
     pub bytes: Vec<u8>,
     pub dos_header: DosHeader,
     pub file_header: FileHeader,
+    pub optional_header: OptionalHeader,
 }
 
 impl Editor {
@@ -43,11 +52,13 @@ impl Editor {
         let dos_header = Self::parse_dos_header(&bytes);
         let e_lfanew: u32 = from_bytes(dos_header.e_lfanew);
         let file_header = Self::parse_file_header(&bytes, e_lfanew as usize);
+        let optional_header = Self::parse_optional_header(&bytes, e_lfanew as usize);
         
         Ok(Self {
             bytes,
             dos_header,
             file_header,
+            optional_header,
         })
     }
 
@@ -119,6 +130,115 @@ impl Editor {
             characteristics,
         }
     }
+
+    fn parse_optional_header(buf: &[Byte], e_lfanew: usize) -> OptionalHeader {
+        let nt_headers_buf = &buf[e_lfanew..];
+        let mut pos: usize = 24; // 24 bytes reserved for signature and file header
+
+        // Standard fields
+        let magic = read_n_bytes_le::<2>(nt_headers_buf, &mut pos);
+        let major_linker_ver = [nt_headers_buf[pos]]; pos += 1;
+        let minor_linker_ver = [nt_headers_buf[pos]]; pos += 1;
+        let size_of_code = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let size_of_init_data = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let size_of_uninit_data = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let addr_of_entry_point = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let base_of_code = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let base_of_data = if magic == OPTIONAL_HDR32_MAGIC {
+            Some(read_n_bytes_le::<4>(nt_headers_buf, &mut pos))
+        } else {
+            None
+        };
+    
+        // Windows-specific fields
+        let image_base: DifArch;
+        if magic == OPTIONAL_HDR32_MAGIC {
+            image_base = DifArch::B32(read_n_bytes_le::<4>(nt_headers_buf, &mut pos));
+        } else {
+            image_base = DifArch::B64(read_n_bytes_le::<8>(nt_headers_buf, &mut pos));
+        }
+        
+        let section_alignment = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let file_alignment = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let os_version_major = read_n_bytes_le::<2>(nt_headers_buf, &mut pos);
+        let os_version_minor = read_n_bytes_le::<2>(nt_headers_buf, &mut pos);
+        let image_version_major = read_n_bytes_le::<2>(nt_headers_buf, &mut pos);
+        let image_version_minor = read_n_bytes_le::<2>(nt_headers_buf, &mut pos);
+        let subsystem_version_major = read_n_bytes_le::<2>(nt_headers_buf, &mut pos);
+        let subsystem_version_minor = read_n_bytes_le::<2>(nt_headers_buf, &mut pos);
+        let win32_version_value = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let size_of_image = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let size_of_headers = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let checksum = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let subsystem = read_n_bytes_le::<2>(nt_headers_buf, &mut pos);
+        let dll_characteristics = read_n_bytes_le::<2>(nt_headers_buf, &mut pos);
+        let size_of_stack_reserve: DifArch;
+        let size_of_stack_commit: DifArch;
+        let size_of_heap_reserve: DifArch;
+        let size_of_heap_commit: DifArch;
+        if magic == OPTIONAL_HDR32_MAGIC {
+            size_of_stack_reserve = DifArch::B32(read_n_bytes_le::<4>(nt_headers_buf, &mut pos));
+            size_of_stack_commit = DifArch::B32(read_n_bytes_le::<4>(nt_headers_buf, &mut pos));
+            size_of_heap_reserve = DifArch::B32(read_n_bytes_le::<4>(nt_headers_buf, &mut pos));
+            size_of_heap_commit = DifArch::B32(read_n_bytes_le::<4>(nt_headers_buf, &mut pos));
+        } else {
+            size_of_stack_reserve = DifArch::B64(read_n_bytes_le::<8>(nt_headers_buf, &mut pos));
+            size_of_stack_commit = DifArch::B64(read_n_bytes_le::<8>(nt_headers_buf, &mut pos));
+            size_of_heap_reserve = DifArch::B64(read_n_bytes_le::<8>(nt_headers_buf, &mut pos));
+            size_of_heap_commit = DifArch::B64(read_n_bytes_le::<8>(nt_headers_buf, &mut pos));
+        }
+        let loader_flags = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+        let number_of_rva_and_sizes = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+    
+        let mut data_directories = [None; 16];
+        let dir_count = std::cmp::min(from_bytes::<u32>(number_of_rva_and_sizes) as usize, 16);
+        for i in 0..dir_count {
+            let address = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+            let size = read_n_bytes_le::<4>(nt_headers_buf, &mut pos);
+            
+            data_directories[i] = Some(ImageDataDirectory {
+                address,
+                size,
+            })
+        }
+
+        OptionalHeader {
+            // Standard fields
+            magic,
+            major_linker_ver,
+            minor_linker_ver,
+            size_of_code,
+            size_of_init_data,
+            size_of_uninit_data,
+            addr_of_entry_point,
+            base_of_code,
+            base_of_data,
+        
+            // Windows-specific fields
+            image_base,
+            section_alignment,
+            file_alignment,
+            os_version_major,
+            os_version_minor,
+            image_version_major,
+            image_version_minor,
+            subsystem_version_major,
+            subsystem_version_minor,
+            win32_version_value,
+            size_of_image,
+            size_of_headers,
+            checksum,
+            subsystem,
+            dll_characteristics,
+            size_of_stack_reserve,
+            size_of_stack_commit,
+            size_of_heap_reserve,
+            size_of_heap_commit,
+            loader_flags,
+            number_of_rva_and_sizes,
+            data_directories,
+        }
+    }
 }
 
 /// 64-byte structure on all target architectures
@@ -157,6 +277,50 @@ pub struct FileHeader {
     number_of_symbols: [Byte; 4],
     size_of_optional_header: [Byte; 2],
     characteristics: [Byte; 2],
+}
+
+#[derive(Debug, PartialEq)]
+pub struct OptionalHeader {
+    // Standard fields
+    magic: [Byte; 2],
+    major_linker_ver: [Byte; 1],
+    minor_linker_ver: [Byte; 1],
+    size_of_code: [Byte; 4],
+    size_of_init_data: [Byte; 4],
+    size_of_uninit_data: [Byte; 4],
+    addr_of_entry_point: [Byte; 4],
+    base_of_code: [Byte; 4],
+    base_of_data: Option<[Byte; 4]>,
+
+    // Windows-specific fields
+    image_base: DifArch,
+    section_alignment: [Byte; 4],
+    file_alignment: [Byte; 4],
+    os_version_major: [Byte; 2],
+    os_version_minor: [Byte; 2],
+    image_version_major: [Byte; 2],
+    image_version_minor: [Byte; 2],
+    subsystem_version_major: [Byte; 2],
+    subsystem_version_minor: [Byte; 2],
+    win32_version_value: [Byte; 4],
+    size_of_image: [Byte; 4],
+    size_of_headers: [Byte; 4],
+    checksum: [Byte; 4],
+    subsystem: [Byte; 2],
+    dll_characteristics: [Byte; 2],
+    size_of_stack_reserve: DifArch,
+    size_of_stack_commit: DifArch,
+    size_of_heap_reserve: DifArch,
+    size_of_heap_commit: DifArch,
+    loader_flags: [Byte; 4],
+    number_of_rva_and_sizes: [Byte; 4],
+    data_directories: [Option<ImageDataDirectory>; 16],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ImageDataDirectory {
+    address: [Byte; 4],
+    size: [Byte; 4],
 }
 
 fn read_n_bytes_le<const N: usize>(buf: &[u8], pos: &mut usize) -> [Byte; N] {
@@ -398,5 +562,227 @@ mod test {
         };
 
         assert_eq!(file_header, expected_file_header);
+    }
+
+    #[test]
+    fn correct_optional_header_32() {
+        let path_buf = PathBuf::from("tests/binaries/hello_gui_32.exe");
+        let editor = Editor::new(&path_buf).unwrap();
+        let dos_header = Editor::parse_dos_header(&editor.bytes);
+        let e_lfanew: u32 = from_bytes(dos_header.e_lfanew);
+        let optional_header = Editor::parse_optional_header(&editor.bytes, e_lfanew as usize);
+        let expected_optional_header = OptionalHeader {
+            magic: to_bytes(0x10b as u16),
+            major_linker_ver: to_bytes(0xe as u8),
+            minor_linker_ver: to_bytes(0x2c as u8),
+            size_of_code: to_bytes(0x13600 as u32),
+            size_of_init_data: to_bytes(0x6000 as u32),
+            size_of_uninit_data: to_bytes(0x0 as u32),
+            addr_of_entry_point: to_bytes(0x12aaa as u32),
+            base_of_code: to_bytes(0x1000 as u32),
+            base_of_data: Some(to_bytes(0x15000 as u32)),
+        
+            image_base: DifArch::B32(to_bytes(0x400000 as u32)),
+            section_alignment: to_bytes(0x1000 as u32),
+            file_alignment: to_bytes(0x200 as u32),
+            os_version_major: to_bytes(0x6 as u16),
+            os_version_minor: to_bytes(0x0 as u16),
+            image_version_major: to_bytes(0x0 as u16),
+            image_version_minor: to_bytes(0x0 as u16),
+            subsystem_version_major: to_bytes(0x6 as u16),
+            subsystem_version_minor: to_bytes(0x0 as u16),
+            win32_version_value: to_bytes(0x0 as u32),
+            size_of_image: to_bytes(0x1c000 as u32),
+            size_of_headers: to_bytes(0x400 as u32),
+            checksum: to_bytes(0x0 as u32),
+            subsystem: to_bytes(0x2 as u16),
+            dll_characteristics: to_bytes(0x8140 as u16),
+            size_of_stack_reserve: DifArch::B32(to_bytes(0x100000 as u32)),
+            size_of_stack_commit: DifArch::B32(to_bytes(0x1000 as u32)),
+            size_of_heap_reserve: DifArch::B32(to_bytes(0x100000 as u32)),
+            size_of_heap_commit: DifArch::B32(to_bytes(0x1000 as u32)),
+            loader_flags: to_bytes(0x0 as u32),
+            number_of_rva_and_sizes: to_bytes(0x10 as u32),
+            data_directories: [
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x1924c as u32),
+                    size: to_bytes(0xdc as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x1b000 as u32),
+                    size: to_bytes(0xda0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x181c0 as u32),
+                    size: to_bytes(0x54 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x18240 as u32),
+                    size: to_bytes(0x18 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x18100 as u32),
+                    size: to_bytes(0x40 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x15000 as u32),
+                    size: to_bytes(0x164 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+            ],
+        };
+
+
+        assert_eq!(optional_header, expected_optional_header);
+    }
+
+    #[test]
+    fn correct_optional_header_64() {
+        let path_buf = PathBuf::from("tests/binaries/hello_gui_64.exe");
+        let editor = Editor::new(&path_buf).unwrap();
+        let dos_header = Editor::parse_dos_header(&editor.bytes);
+        let e_lfanew: u32 = from_bytes(dos_header.e_lfanew);
+        let optional_header = Editor::parse_optional_header(&editor.bytes, e_lfanew as usize);
+        let expected_optional_header = OptionalHeader {
+            magic: to_bytes(0x20b as u16),
+            major_linker_ver: to_bytes(0xe as u8),
+            minor_linker_ver: to_bytes(0x2c as u8),
+            size_of_code: to_bytes(0x14400 as u32),
+            size_of_init_data: to_bytes(0x8200 as u32),
+            size_of_uninit_data: to_bytes(0x0 as u32),
+            addr_of_entry_point: to_bytes(0x13620 as u32),
+            base_of_code: to_bytes(0x1000 as u32),
+            base_of_data: None,
+        
+            image_base: DifArch::B64(to_bytes(0x140000000 as u64)),
+            section_alignment: to_bytes(0x1000 as u32),
+            file_alignment: to_bytes(0x200 as u32),
+            os_version_major: to_bytes(0x6 as u16),
+            os_version_minor: to_bytes(0x0 as u16),
+            image_version_major: to_bytes(0x0 as u16),
+            image_version_minor: to_bytes(0x0 as u16),
+            subsystem_version_major: to_bytes(0x6 as u16),
+            subsystem_version_minor: to_bytes(0x0 as u16),
+            win32_version_value: to_bytes(0x0 as u32),
+            size_of_image: to_bytes(0x20000 as u32),
+            size_of_headers: to_bytes(0x400 as u32),
+            checksum: to_bytes(0x0 as u32),
+            subsystem: to_bytes(0x2 as u16),
+            dll_characteristics: to_bytes(0x8160 as u16),
+            size_of_stack_reserve: DifArch::B64(to_bytes(0x100000 as u64)),
+            size_of_stack_commit: DifArch::B64(to_bytes(0x1000 as u64)),
+            size_of_heap_reserve: DifArch::B64(to_bytes(0x100000 as u64)),
+            size_of_heap_commit: DifArch::B64(to_bytes(0x1000 as u64)),
+            loader_flags: to_bytes(0x0 as u32),
+            number_of_rva_and_sizes: to_bytes(0x10 as u32),
+            data_directories: [
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x1c074 as u32),
+                    size: to_bytes(0xdc as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x1e000 as u32),
+                    size: to_bytes(0xdd4 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x1f000 as u32),
+                    size: to_bytes(0x204 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x19ea0 as u32),
+                    size: to_bytes(0x54 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x19f00 as u32),
+                    size: to_bytes(0x28 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x19d60 as u32),
+                    size: to_bytes(0x140 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x16000 as u32),
+                    size: to_bytes(0x2c8 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+                Some(ImageDataDirectory {
+                    address: to_bytes(0x0 as u32),
+                    size: to_bytes(0x0 as u32),
+                }),
+            ],
+        };
+
+
+        assert_eq!(optional_header, expected_optional_header);
     }
 }
