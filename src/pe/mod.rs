@@ -1,17 +1,23 @@
+mod helpers;
+pub mod types;
+
+use helpers::{from_bytes, read_n_bytes_le};
 use std::fs;
 use std::path::{ PathBuf };
+use types::{
+  Byte,
+  DifArch,
+  DosHeader,
+  FileHeader,
+  ImageDataDirectory,
+  OptionalHeader,
+  SectionTable,
+  SectionTableEntry,  
+};
 
 const FILE_HEADER_SIZE: usize = 20;
 const NT_HEADER_SIG_SIZE: usize = 4;
 const OPTIONAL_HDR32_MAGIC: [Byte; 2] = [0x01, 0x0b];
-
-type Byte = u8;
-
-#[derive(Debug, PartialEq)]
-enum DifArch {
-    B32([Byte; 4]),
-    B64([Byte; 8]),
-}
 
 #[derive(thiserror::Error, Debug)]
 pub enum EditorError {
@@ -67,6 +73,16 @@ impl Editor {
         })
     }
 
+    pub fn get_section_bytes<'a>(
+        buf: &'a [u8],
+        section: &SectionTableEntry,
+    ) -> &'a [u8] {
+        let start = from_bytes::<u32>(section.pointer_to_raw_data) as usize;
+        let end = start + from_bytes::<u32>(section.size_of_raw_data) as usize;
+    
+        &buf[start..end]
+    }
+    
     fn parse_dos_header(buf: &[Byte]) -> DosHeader {
         let mut pos: usize = 0;
 
@@ -288,268 +304,10 @@ impl Editor {
     }
 }
 
-/// 64-byte structure on all target architectures
-/// Makes PE file an MS-DOS executable
-#[derive(Debug, PartialEq)]
-pub struct DosHeader {
-    pub e_magic: [Byte; 2],
-    pub e_cblp: [Byte; 2],
-    pub e_cp: [Byte; 2],
-    pub e_crlc: [Byte; 2],
-    pub e_cparhdr: [Byte; 2],
-    pub e_minalloc: [Byte; 2],
-    pub e_maxalloc: [Byte; 2],
-    pub e_ss: [Byte; 2],
-    pub e_sp: [Byte; 2],
-    pub e_csum: [Byte; 2],
-    pub e_ip: [Byte; 2],
-    pub e_cs: [Byte; 2],
-    pub e_lfarlc: [Byte; 2],
-    pub e_ovno: [Byte; 2],
-    pub e_res: [Byte; 8],
-    pub e_oemid: [Byte; 2],
-    pub e_oeminfo: [Byte; 2],
-    pub e_res2: [Byte; 20],
-    pub e_lfanew: [Byte; 4]
-}
-
-/// 20-byte structure on all target architectures
-/// Includes general info about the PE file
-#[derive(Debug, PartialEq)]
-pub struct FileHeader {
-    machine: [Byte; 2],
-    number_of_sections: [Byte; 2],
-    time_date_stamp: [Byte; 4],
-    pointer_to_symbol_table: [Byte; 4],
-    number_of_symbols: [Byte; 4],
-    size_of_optional_header: [Byte; 2],
-    characteristics: [Byte; 2],
-}
-
-#[derive(Debug, PartialEq)]
-pub struct OptionalHeader {
-    // Standard fields
-    magic: [Byte; 2],
-    major_linker_ver: [Byte; 1],
-    minor_linker_ver: [Byte; 1],
-    size_of_code: [Byte; 4],
-    size_of_init_data: [Byte; 4],
-    size_of_uninit_data: [Byte; 4],
-    addr_of_entry_point: [Byte; 4],
-    base_of_code: [Byte; 4],
-    base_of_data: Option<[Byte; 4]>,
-
-    // Windows-specific fields
-    image_base: DifArch,
-    section_alignment: [Byte; 4],
-    file_alignment: [Byte; 4],
-    os_version_major: [Byte; 2],
-    os_version_minor: [Byte; 2],
-    image_version_major: [Byte; 2],
-    image_version_minor: [Byte; 2],
-    subsystem_version_major: [Byte; 2],
-    subsystem_version_minor: [Byte; 2],
-    win32_version_value: [Byte; 4],
-    size_of_image: [Byte; 4],
-    size_of_headers: [Byte; 4],
-    checksum: [Byte; 4],
-    subsystem: [Byte; 2],
-    dll_characteristics: [Byte; 2],
-    size_of_stack_reserve: DifArch,
-    size_of_stack_commit: DifArch,
-    size_of_heap_reserve: DifArch,
-    size_of_heap_commit: DifArch,
-    loader_flags: [Byte; 4],
-    number_of_rva_and_sizes: [Byte; 4],
-    data_directories: [Option<ImageDataDirectory>; 16],
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ImageDataDirectory {
-    address: [Byte; 4],
-    size: [Byte; 4],
-}
-
-pub type SectionTable = Vec<SectionTableEntry>;
-
-#[derive(Debug, PartialEq)]
-pub struct SectionTableEntry {
-    name: [Byte; 8],
-    virtual_size: [Byte; 4],
-    virtual_addr: [Byte; 4],
-    size_of_raw_data: [Byte; 4],
-    pointer_to_raw_data: [Byte; 4],
-    pointer_to_relocations: [Byte; 4],
-    pointer_to_line_nums: [Byte; 4],
-    number_of_relocations: [Byte; 2],
-    number_of_line_nums: [Byte; 2],
-    characteristics: [Byte; 4],
-}
-
-pub fn get_section_bytes<'a>(
-    buf: &'a [u8],
-    section: &SectionTableEntry,
-) -> &'a [u8] {
-    let start = from_bytes::<u32>(section.pointer_to_raw_data) as usize;
-    let end = start + from_bytes::<u32>(section.size_of_raw_data) as usize;
-
-    &buf[start..end]
-}
-
-fn read_n_bytes_le<const N: usize>(buf: &[u8], pos: &mut usize) -> [Byte; N] {
-    let bytes = &buf[*pos..*pos + N];
-    let mut res = [0u8; N];
-    
-    res.copy_from_slice(bytes);
-    res.reverse();
-    
-    *pos += N;
-    
-    res
-}
-
-trait BytesConversion: Sized {
-    type Bytes;
-
-    fn to_bytes(self) -> Self::Bytes;
-    fn from_bytes(bytes: Self::Bytes) -> Self;
-}
-
-impl BytesConversion for u8 {
-    type Bytes = [u8; 1];
-
-    fn to_bytes(self) -> Self::Bytes {
-        self.to_be_bytes()
-    }
-
-    fn from_bytes(bytes: Self::Bytes) -> Self {
-        Self::from_be_bytes(bytes)
-    }
-}
-
-impl BytesConversion for u16 {
-    type Bytes = [u8; 2];
-
-    fn to_bytes(self) -> Self::Bytes {
-        self.to_be_bytes()
-    }
-
-    fn from_bytes(bytes: Self::Bytes) -> Self {
-        Self::from_be_bytes(bytes)
-    }
-}
-
-impl BytesConversion for u32 {
-    type Bytes = [u8; 4];
-
-    fn to_bytes(self) -> Self::Bytes {
-        self.to_be_bytes()
-    }
-
-    fn from_bytes(bytes: Self::Bytes) -> Self {
-        Self::from_be_bytes(bytes)
-    }
-}
-
-impl BytesConversion for u64 {
-    type Bytes = [u8; 8];
-
-    fn to_bytes(self) -> Self::Bytes {
-        self.to_be_bytes()
-    }
-
-    fn from_bytes(bytes: Self::Bytes) -> Self {
-        Self::from_be_bytes(bytes)
-    }
-}
-
-fn to_bytes<T: BytesConversion>(value: T) -> T::Bytes {
-    value.to_bytes()
-}
-
-fn from_bytes<T: BytesConversion>(bytes: T::Bytes) -> T {
-    T::from_bytes(bytes)
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-
-    mod bytes_conversion {
-        use super::*;
-
-        #[test]
-        fn to_bytes_u8() {
-            let x: u8 = 0x3a;
-            let byte = to_bytes(x);
-            let expected: [Byte; 1] = [0x3a];
-
-            assert_eq!(byte, expected);
-        }
-
-        #[test]
-        fn to_bytes_u16() {
-            let x: u16 = 0x3ae2;
-            let bytes = to_bytes(x);
-            let expected: [Byte; 2] = [0x3a, 0xe2];
-
-            assert_eq!(bytes, expected);
-        }
-
-        #[test]
-        fn to_bytes_u32() {
-            let x: u32 = 0x3ae200;
-            let bytes = to_bytes(x);
-            let expected: [Byte; 4] = [0x0, 0x3a, 0xe2, 0x0];
-
-            assert_eq!(bytes, expected);
-        }
-
-        #[test]
-        fn to_bytes_u64() {
-            let x: u64 = 0x3ae200a1ff23b2;
-            let bytes = to_bytes(x);
-            let expected: [Byte; 8] = [0x0, 0x3a, 0xe2, 0x0, 0xa1, 0xff, 0x23, 0xb2];
-
-            assert_eq!(bytes, expected);
-        }
-
-        #[test]
-        fn from_bytes_u8() {
-            let bytes: [Byte; 1] = [0x3a];
-            let x: u8 = from_bytes(bytes);
-            let expected: u8 = 0x3a;
-
-            assert_eq!(x, expected);
-        }
-        
-        #[test]
-        fn from_bytes_u16() {
-            let bytes: [Byte; 2] = [0x3a, 0xe2];
-            let x: u16 = from_bytes(bytes);
-            let expected: u16 = 0x3ae2;
-
-            assert_eq!(x, expected);
-        }
-
-        #[test]
-        fn from_bytes_u32() {
-            let bytes: [Byte; 4] = [0x0, 0x3a, 0xe2, 0x0];
-            let x: u32 = from_bytes(bytes);
-            let expected: u32 = 0x3ae200;
-
-            assert_eq!(x, expected);
-        }
-
-        #[test]
-        fn from_bytes_u64() {
-            let bytes: [Byte; 8] = [0x0, 0x3a, 0xe2, 0x0, 0xa1, 0xff, 0x23, 0xb2];
-            let x: u64 = from_bytes(bytes);
-            let expected: u64 = 0x3ae200a1ff23b2;
-
-            assert_eq!(x, expected);
-        }
-    }
+    use crate::pe::helpers::to_bytes;
 
     #[test]
     fn valid_new_editor() {
