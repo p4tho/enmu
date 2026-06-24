@@ -307,7 +307,7 @@ impl Editor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::pe::helpers::to_bytes;
+    use crate::helpers::to_bytes;
 
     #[test]
     fn valid_new_editor() {

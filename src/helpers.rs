@@ -1,4 +1,4 @@
-use crate::pe::types::{ Byte };
+use crate::types::{ Byte };
 
 pub trait BytesConversion: Sized {
     type Bytes;
